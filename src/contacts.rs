@@ -1538,29 +1538,47 @@ fn registry_books() -> Option<HashMap<String, String>> {
 /// Every source the EDS registry holds: (object path, UID, key file).
 /// `None` when the registry can't be reached.
 pub(crate) fn registry_sources() -> Option<Vec<(String, String, String)>> {
+    use gtk::gio;
+
     let dest = sources_dest()?;
-    let conn = zbus::blocking::Connection::session().ok()?;
-    let reply = conn
-        .call_method(
-            Some(dest.as_str()),
-            "/org/gnome/evolution/dataserver/SourceManager",
-            Some("org.freedesktop.DBus.ObjectManager"),
-            "GetManagedObjects",
-            &(),
-        )
-        .ok()?;
-    type Props = HashMap<String, zbus::zvariant::OwnedValue>;
-    type Objects = HashMap<zbus::zvariant::OwnedObjectPath, HashMap<String, Props>>;
-    let (objects,): (Objects,) = reply.body().deserialize().ok()?;
+    let conn = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok()?;
+    // zbus 4's blocking call has no deadline. A deadlocked source registry
+    // used to strand every composer lookup forever. GIO bounds the actual
+    // request, so the worker can fall back to cached books and mail history
+    // instead of leaving another blocked thread behind on every open.
+    let reply = match conn.call_sync(
+        Some(dest.as_str()),
+        "/org/gnome/evolution/dataserver/SourceManager",
+        "org.freedesktop.DBus.ObjectManager",
+        "GetManagedObjects",
+        None,
+        None,
+        gio::DBusCallFlags::NONE,
+        3000,
+        gio::Cancellable::NONE,
+    ) {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::warn!("EDS source registry unavailable: {e}");
+            return None;
+        }
+    };
+    sources_from_reply(&reply)
+}
+
+fn sources_from_reply(reply: &gtk::glib::Variant) -> Option<Vec<(String, String, String)>> {
+    type Props = HashMap<String, gtk::glib::Variant>;
+    type Objects = HashMap<gtk::glib::variant::ObjectPath, HashMap<String, Props>>;
+    let (objects,): (Objects,) = reply.get()?;
     let mut sources = Vec::new();
     for (path, ifaces) in &objects {
         let Some(props) = ifaces.get("org.gnome.evolution.dataserver.Source") else {
             continue;
         };
         let uid =
-            props.get("UID").and_then(|v| v.downcast_ref::<&str>().ok()).map(str::to_string);
+            props.get("UID").and_then(|v| v.str()).map(str::to_string);
         let data =
-            props.get("Data").and_then(|v| v.downcast_ref::<&str>().ok()).map(str::to_string);
+            props.get("Data").and_then(|v| v.str()).map(str::to_string);
         if let (Some(uid), Some(data)) = (uid, data) {
             sources.push((path.to_string(), uid, data));
         }
@@ -2351,6 +2369,24 @@ pub fn delete_contact(book_uid: &str, uid: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registry_reply_keeps_sources_and_skips_unrelated_objects() {
+        use gtk::glib::{variant::ObjectPath, variant::ToVariant};
+        use std::collections::HashMap;
+        let path = ObjectPath::try_from("/org/gnome/evolution/dataserver/Source/test").unwrap();
+        let data = "[Data Source]\nDisplayName=Test\n[Address Book]\nBackendName=local\n";
+        let objects = HashMap::from([
+            (path.clone(), HashMap::from([("org.gnome.evolution.dataserver.Source", HashMap::from([
+                ("UID", "test".to_variant()), ("Data", data.to_variant()),
+            ]))])),
+            (ObjectPath::try_from("/unrelated").unwrap(), HashMap::new()),
+        ]);
+        assert_eq!(super::sources_from_reply(&(objects,).to_variant()), Some(vec![
+            (path.to_string(), "test".into(), data.into()),
+        ]));
+        assert!(super::sources_from_reply(&"wrong reply type".to_variant()).is_none());
+    }
+
     use super::{
         details_from_local_vcards, is_local_book, prefer_book, Book, merge_target, vcard_display_name, vcard_photo,
         vcard_photo_with,

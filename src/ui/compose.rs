@@ -288,8 +288,8 @@ pub struct ComposeInit {
     pub accounts: Vec<ComposeAccount>,
     /// Index into `accounts` of the account to send from by default.
     pub selected: usize,
-    /// Recipient autocomplete suggestions (Contacts + mail history).
-    pub suggestions: Vec<Suggestion>,
+    /// Own addresses to include in the suggestions loaded after opening.
+    pub own_addresses: Vec<(String, String)>,
     /// Whether the pane starts hosted in a standalone window (vs. inline).
     pub windowed: bool,
     /// Whether the inline/window toggle button is offered (reply/forward only).
@@ -665,6 +665,8 @@ pub enum ComposeInput {
     /// The accounts whose organization directory is searched (#410), and
     /// the addresses in the mail of those that suggest only their own.
     DirectoriesKnown { graph: Vec<crate::config::AccountConfig>, own_mail: OwnMail },
+    /// Contacts and mail history loaded off the UI thread.
+    SuggestionsLoaded(Vec<Suggestion>),
     /// The typing paused: ask the directories, unless it went on since.
     DirectoryLookup { field: Field, token: String, generation: u64 },
     /// What the directories answered, and the failures not shown before.
@@ -1145,7 +1147,7 @@ impl Component for Compose {
             prefill,
             accounts,
             selected,
-            suggestions,
+            own_addresses,
             windowed,
             can_toggle,
             compact,
@@ -1352,7 +1354,7 @@ impl Component for Compose {
             signature_position,
             attachments: prefill_attachments,
             attach_thumbs: Default::default(),
-            suggestions,
+            suggestions: Vec::new(),
             graph_directories: Default::default(),
             own_mail: Default::default(),
             from_account: 0,
@@ -1713,6 +1715,10 @@ impl Component for Compose {
                     _ => OwnMail::new(),
                 };
                 let _ = s.send(ComposeInput::DirectoriesKnown { graph, own_mail });
+                // EDS can stop answering, and a large mail cache takes time
+                // to scan. Neither is a prerequisite for writing a message.
+                let suggestions = crate::contacts::suggestions(&own_addresses);
+                let _ = s.send(ComposeInput::SuggestionsLoaded(suggestions));
             });
         }
 
@@ -2504,6 +2510,23 @@ impl Component for Compose {
             ComposeInput::DirectoriesKnown { graph, own_mail } => {
                 self.graph_directories = std::sync::Arc::new(graph);
                 self.own_mail = own_mail;
+            }
+
+            ComposeInput::SuggestionsLoaded(loaded) => {
+                tracing::debug!("composer suggestions loaded: {}", loaded.len());
+                merge_loaded_suggestions(&mut self.suggestions, loaded);
+                // The user may already be typing. Update that field's
+                // matches without touching its text, caret or dirty state.
+                for (field, row) in [
+                    (Field::To, &widgets.to_row),
+                    (Field::Cc, &widgets.cc_row),
+                    (Field::Bcc, &widgets.bcc_row),
+                ] {
+                    if recipient_focused(row) {
+                        self.show_completion(field, row, &widgets.bcc_row);
+                        break;
+                    }
+                }
             }
 
             ComposeInput::DirectoryLookup { field, token, generation } => {
@@ -3302,6 +3325,26 @@ impl Component for Compose {
 
 /// How often an edited message is saved to Drafts on its own (#340).
 const AUTOSAVE_SECS: u32 = 30;
+
+/// Keep addresses sent from another composer while the initial lookup was
+/// running. The loaded contact metadata (including groups and own-address
+/// ranking) wins; addresses added during the lookup must not disappear.
+fn merge_loaded_suggestions(current: &mut Vec<Suggestion>, mut loaded: Vec<Suggestion>) {
+    for recent in current.drain(..) {
+        if let Some(s) = loaded.iter_mut().find(|s| {
+            s.group.is_none() && s.email.eq_ignore_ascii_case(&recent.email)
+        }) {
+            // The snapshot may already include that send: do not count it twice.
+            s.score = s.score.max(recent.score);
+            if s.name.trim().is_empty() || s.name == s.email {
+                s.name = recent.name;
+            }
+        } else {
+            loaded.push(recent);
+        }
+    }
+    *current = loaded;
+}
 
 /// An identity's From as the composer writes it out: "Name <address>".
 fn identity_display(a: &ComposeAccount) -> String {
@@ -4824,6 +4867,43 @@ var t=document.getElementById('src');if(t)t.readOnly=false;window.__hylkiTr=null
 
 #[cfg(test)]
 mod tests {
+    use crate::contacts::{Suggestion, SuggestedGroup};
+
+    fn suggestion(name: &str, email: &str, score: u32) -> Suggestion {
+        Suggestion {
+            name: name.into(), email: email.into(), score,
+            from_contacts: false, from_directory: false, own: false, group: None,
+        }
+    }
+
+    #[test]
+    fn initial_suggestions_keep_addresses_added_while_loading() {
+        let mut current = vec![suggestion("Ann", "ANN@example.org", 2), suggestion("Bob", "bob@example.org", 1)];
+        let mut contact = suggestion("Ann Contact", "ann@example.org", 5);
+        contact.from_contacts = true;
+        contact.own = true;
+        let mut group = suggestion("Book Club", "", 0);
+        group.group = Some(std::sync::Arc::new(SuggestedGroup { members: Vec::new(), hide_addresses: true }));
+        super::merge_loaded_suggestions(&mut current, vec![contact, group]);
+        assert_eq!(current.len(), 3);
+        let ann = &current[0];
+        assert_eq!(ann.name, "Ann Contact");
+        assert_eq!(ann.score, 5);
+        assert!(ann.from_contacts && ann.own);
+        assert!(current[1].group.is_some());
+        assert_eq!(current[2].email, "bob@example.org");
+    }
+
+    #[test]
+    fn initial_suggestions_keep_newer_names_and_frequency() {
+        let mut current = vec![suggestion("Ann", "ann@example.org", 3)];
+        super::merge_loaded_suggestions(&mut current, vec![suggestion("ann@example.org", "ann@example.org", 1)]);
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].name, "Ann");
+        assert_eq!(current[0].score, 3);
+        super::merge_loaded_suggestions(&mut current, Vec::new());
+        assert_eq!(current[0].name, "Ann");
+    }
 
     #[test]
     fn a_markdown_reply_has_a_line_to_write_on_above_the_quote() {

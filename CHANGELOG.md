@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Fixed: Reply and New Message froze when the contact service stopped
+  answering.** The composer opens before loading recipient suggestions.
+  Contact lookups run in the background and give up after three seconds
+  without an answer, using cached contacts and mail history instead.
+
 - **Changed: one Contacts page in Settings.** Settings → Contacts lists
   every address book Hylki reads, as Mail Accounts lists mail accounts: the
   Hylki book, the books on this computer, each GNOME Online Accounts account
